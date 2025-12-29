@@ -1,0 +1,42 @@
+name: GoldTrendAlert Liquidity v1.5.10
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 12:50 CST (UTC+8) == 04:50 UTC
+    - cron: '50 4 * * *'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 建议把下面两个也放到 Secrets（避免把 Key 写进仓库）
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          SOSOVALUE_API_KEY: ${{ secrets.SOSOVALUE_API_KEY }}
+
+          # 以下均为可选；不填则使用脚本默认值
+          BTC_ETF_FLOWS_CSV_URL: ${{ vars.BTC_ETF_FLOWS_CSV_URL }}
+          WGC_CSV_URL: ${{ vars.WGC_CSV_URL }}
+          FAIR_BAND_LOW: ${{ vars.FAIR_BAND_LOW }}
+          FAIR_BAND_HIGH: ${{ vars.FAIR_BAND_HIGH }}
+          PLAN_MAX_GOLD_WEIGHT: ${{ vars.PLAN_MAX_GOLD_WEIGHT }}
+          TAKE_PROFIT_LEVELS: ${{ vars.TAKE_PROFIT_LEVELS }}
+          BUY_TRIGGER: ${{ vars.BUY_TRIGGER }}
+        run: |
+          python liquidity_monitor_bot_v1_5_10.py

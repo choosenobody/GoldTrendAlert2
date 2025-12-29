@@ -1,4 +1,4 @@
-name: GoldTrendAlert Liquidity Monitor v1.5.11
+name: GoldTrendAlert Liquidity Monitor v1.5.12
 
 on:
   workflow_dispatch:
@@ -28,8 +28,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          # 建议用 Secrets
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           SOSOVALUE_API_KEY: ${{ secrets.SOSOVALUE_API_KEY }}
 
@@ -38,11 +36,10 @@ jobs:
 
           FAIR_BAND_LOW: "3600"
           FAIR_BAND_HIGH: "4200"
-
           PLAN_MAX_GOLD_WEIGHT: "18.0"
           BUY_TRIGGER: "4100"
           BUY_BANDS: "3960-3920,3920-3850,3850-3780"
           TAKE_PROFIT_LEVELS: "4600,4850,5050"
 
         run: |
-          python liquidity_monitor_bot_v1_5_11.py
+          python liquidity_monitor_bot_v1_5_12.py

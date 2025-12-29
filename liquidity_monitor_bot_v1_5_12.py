@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GoldTrendAlert | Liquidity Monitor Bot v1.5.11
+GoldTrendAlert | Liquidity Monitor Bot v1.5.12
 
-本版改动（针对你的反馈）：
-1) 修复 #3 BTC现货ETF净流(周) 的 N/A：
-   - CSV 解析更“自适应”：支持 totalNetInflow / total_net_inflow / net_flow_usd / flow 等多种列名；
-   - 如果找不到列名，则自动选择“除日期列外的第一个数值列”；
-   - 若 CSV 仍失败，则回退 SoSoValue（使用更可靠的 open.sosovalue.xyz / openapi.sosovalue.com 的历史流入接口）。
-2) 修复 #4 10Y拍卖(BTC) 的 N/A：
-   - Treasury Fiscal Data API 仅做最小过滤（security_type=Note），其余在本地筛选“10-Year 且非TIPS”，更耐字段变化。
-3) 修复 #6 央行购金(趋势) 的 N/A：
-   - WGC CSV 同样自适应：自动识别日期列 + 首个数值列（不再强依赖 net_buy_tonnes 这种列名）。
-4) “风控线”表达更容易决策：
-   - 明确 3 条线（紧/标准/宽）；
-   - 只用“收盘价”判定 → 下一交易日执行；
-   - 给出清晰 if/then。
-5) Telegram 真加粗：parse_mode=HTML，使用 <b>..</b>。
+修复点（针对你这次的 Action 日志）：
+1) Telegram send failed：加入“错误详情打印 + 自动重试 + HTML 安全转义 + 失败回退纯文本”。
+2) #4 10Y拍卖(BTC) N/A：Treasury Fiscal Data 端点不再强制 fields（避免字段名变动导致 400），并自适应寻找 bid_to_cover 字段。
+3) #6 央行购金(趋势) N/A：WGC CSV 日期解析更宽松（YYYY-MM / YYYY/MM / YYYYMM / YYYY-MM-DD 等），数值列自适应。
+4) 输出格式：Telegram 用 HTML 真加粗；stdout 仍打印同样文本便于调试。
 
 依赖：requests
 """
@@ -24,18 +15,17 @@ GoldTrendAlert | Liquidity Monitor Bot v1.5.11
 from __future__ import annotations
 
 import csv
-import json
+import html as _html
 import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, date
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 
-
-# -------------------- Defaults --------------------
 TIMEOUT = 25
 
 DEFAULT_FRED_API_KEY = "46eccf9075cdf430632c2d47d01185ce"
@@ -51,7 +41,6 @@ DEFAULT_TAKE_PROFIT = "4600,4850,5050"
 DEFAULT_BTC_ETF_CSV = "https://raw.githubusercontent.com/choosenobody/GoldTrendAlert/main/.bot_state/btc_spot_etf_flows.csv"
 DEFAULT_WGC_CSV = "https://raw.githubusercontent.com/choosenobody/wgc_netbuy/main/.bot_state/wgc_netbuy.csv"
 
-# Treasury Fiscal Data (auction results)
 TREASURY_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
 TREASURY_AUCTION_ENDPOINT = "/v1/accounting/od/auctions_query"
 
@@ -68,20 +57,14 @@ def now_cst_str() -> str:
 
 def _get(url: str, headers: Optional[Dict[str, str]] = None, params: Optional[dict] = None) -> Optional[requests.Response]:
     try:
-        r = requests.get(url, headers=headers, params=params, timeout=TIMEOUT)
-        if r.status_code >= 400:
-            return None
-        return r
+        return requests.get(url, headers=headers, params=params, timeout=TIMEOUT)
     except Exception:
         return None
 
 
 def _post_json(url: str, headers: Optional[Dict[str, str]] = None, payload: Optional[dict] = None) -> Optional[requests.Response]:
     try:
-        r = requests.post(url, headers=headers, json=(payload or {}), timeout=TIMEOUT)
-        if r.status_code >= 400:
-            return None
-        return r
+        return requests.post(url, headers=headers, json=(payload or {}), timeout=TIMEOUT)
     except Exception:
         return None
 
@@ -113,10 +96,9 @@ def score_linear(x: float, x0: float, x1: float, s0: float, s1: float) -> float:
 
 # -------------------- Price + Vol (14日波动带) --------------------
 def stooq_xau_last_price() -> Optional[float]:
-    # Stooq CSV: date,open,high,low,close
     url = "https://stooq.com/q/d/l/?s=xauusd&i=d"
     r = _get(url)
-    if not r:
+    if not r or r.status_code >= 400:
         return None
     lines = r.text.strip().splitlines()
     if len(lines) < 3:
@@ -131,7 +113,7 @@ def stooq_xau_last_price() -> Optional[float]:
 def stooq_xau_ohlc(last_n: int = 40) -> Optional[List[Dict[str, Any]]]:
     url = "https://stooq.com/q/d/l/?s=xauusd&i=d"
     r = _get(url)
-    if not r:
+    if not r or r.status_code >= 400:
         return None
     rows = list(csv.DictReader(r.text.strip().splitlines()))
     if not rows:
@@ -155,15 +137,11 @@ def stooq_xau_ohlc(last_n: int = 40) -> Optional[List[Dict[str, Any]]]:
 
 
 def compute_vol14_band(price: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
-    """
-    返回：(vol14_usd, vol14_pct)
-    这里的 vol14 是基于 TR 的 14 日平均（接近 ATR，但对用户表述为“14日波动带”）。
-    """
+    """返回：(vol14_usd, vol14_pct)，用 14 日 TR 均值表达为“14日波动带”."""
     ohlc = stooq_xau_ohlc(last_n=40)
     if not ohlc or len(ohlc) < 16:
         return None, None
 
-    # 计算 14 日 TR 平均
     trs = []
     prev_close = ohlc[-15]["close"]
     for bar in ohlc[-14:]:
@@ -180,8 +158,8 @@ def compute_vol14_band(price: Optional[float]) -> Tuple[Optional[float], Optiona
     return float(vol14), (float(vol_pct) if vol_pct is not None else None)
 
 
-# -------------------- FRED helpers --------------------
-def fred_series(series_id: str, api_key: str, limit: int = 800) -> List[Tuple[date, Optional[float]]]:
+# -------------------- FRED --------------------
+def fred_series(series_id: str, api_key: str, limit: int = 900) -> List[Tuple[date, Optional[float]]]:
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {
         "series_id": series_id,
@@ -191,7 +169,7 @@ def fred_series(series_id: str, api_key: str, limit: int = 800) -> List[Tuple[da
         "limit": str(limit),
     }
     r = _get(url, params=params)
-    if not r:
+    if not r or r.status_code >= 400:
         return []
     try:
         j = r.json()
@@ -229,19 +207,14 @@ def nearest_on_or_before(series: List[Tuple[date, Optional[float]]], target: dat
     return best
 
 
-# -------------------- BTC Spot ETF net flows --------------------
+# -------------------- SoSoValue BTC ETF weekly flow --------------------
 def sosovalue_btc_etf_weekly_flow(api_key: str) -> Optional[float]:
-    """
-    更可靠的 SoSoValue 抓取方式：
-    - 使用 historicalInflowChart（返回每日 totalNetInflow），我们求最近 5 条之和 = 周净流（近似）
-    """
+    """取最近5条日净流合计近似“周净流”。"""
     if not api_key:
         return None
 
     bases = ["https://open.sosovalue.xyz", "https://openapi.sosovalue.com"]
     path = "/openapi/v1/etf/us-btc-spot/historicalInflowChart"
-
-    # 两种常见 header 方案都试一下
     header_variants = [
         {"x-soso-api-key": api_key},
         {"Authorization": api_key},
@@ -250,7 +223,7 @@ def sosovalue_btc_etf_weekly_flow(api_key: str) -> Optional[float]:
     for base in bases:
         for hdr in header_variants:
             r = _post_json(base + path, headers=hdr, payload={})
-            if not r:
+            if not r or r.status_code >= 400:
                 continue
             try:
                 j = r.json()
@@ -275,63 +248,48 @@ def sosovalue_btc_etf_weekly_flow(api_key: str) -> Optional[float]:
 
 
 def _detect_date_col(fieldnames: Sequence[str]) -> Optional[str]:
-    if not fieldnames:
-        return None
-    # 优先包含 date 的列
     for k in fieldnames:
         if "date" in k.lower():
             return k
     for k in fieldnames:
-        if any(x in k.lower() for x in ("day", "dt", "time")):
+        if any(x in k.lower() for x in ("day", "dt", "time", "month")):
             return k
-    return fieldnames[0]
-
-
-def _detect_value_col(fieldnames: Sequence[str]) -> Optional[str]:
-    """
-    ETF CSV 的列名变化很大：尽量宽松匹配；
-    若都不匹配，后续会用“首个数值列”兜底。
-    """
-    if not fieldnames:
-        return None
-    candidates = [
-        "weekly_net_flow_usd", "week_net_flow_usd", "weekly_flow_usd", "week_flow_usd",
-        "net_flow_usd", "daily_net_flow_usd", "daily_net_flow", "net_flow",
-        "totalNetInflow", "total_net_inflow", "totalnetinflow",
-        "totalNetInflowUsd", "total_net_inflow_usd",
-        "flow", "inflow", "netInflow", "net_inflow",
-    ]
-    low = {k.lower(): k for k in fieldnames}
-    for c in candidates:
-        if c in fieldnames:
-            return c
-        if c.lower() in low:
-            return low[c.lower()]
-    return None
+    return fieldnames[0] if fieldnames else None
 
 
 def _parse_date_any(s: str) -> Optional[date]:
     s = (s or "").strip()
     if not s:
         return None
-    fmts = ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S")
-    for fmt in fmts:
+
+    s0 = s.replace(".", "-").replace("/", "-").replace("_", "-").strip()
+
+    # YYYYMM
+    m = re.fullmatch(r"(\d{4})(\d{2})", s0)
+    if m:
+        return date(int(m.group(1)), int(m.group(2)), 1)
+
+    # YYYY-MM or YYYY-MM-DD
+    m = re.fullmatch(r"(\d{4})-(\d{2})(?:-(\d{2}))?", s0)
+    if m:
+        y, mo = int(m.group(1)), int(m.group(2))
+        d = int(m.group(3)) if m.group(3) else 1
+        return date(y, mo, d)
+
+    # ISO datetime / datetime
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
-            return datetime.strptime(s[:19], fmt).date()
+            return datetime.strptime(s0[:19], fmt).date()
         except Exception:
-            continue
+            pass
+
     return None
 
 
 def btc_etf_weekly_flow_from_csv(csv_url: str) -> Optional[float]:
-    """
-    读取 CSV，优先：
-    - 若存在“weekly/周净流”列：直接取最新一条
-    - 否则：用“日净流”列求最近 5 条之和
-    - 列名不确定：自动识别日期列 + 数值列
-    """
+    """CSV 自适应：优先周列，否则取最近5条日净流求和。"""
     r = _get(csv_url)
-    if not r:
+    if not r or r.status_code >= 400:
         return None
     text = r.text.strip()
     if not text:
@@ -344,35 +302,38 @@ def btc_etf_weekly_flow_from_csv(csv_url: str) -> Optional[float]:
 
     fieldnames = reader.fieldnames or list(rows[0].keys())
     date_col = _detect_date_col(fieldnames)
-    val_col = _detect_value_col(fieldnames)
-
-    # 1) 尝试直接取“周净流列”
-    weekly_keys = ["weekly_net_flow_usd", "week_net_flow_usd", "weekly_flow_usd", "week_flow_usd"]
     low = {k.lower(): k for k in fieldnames}
-    wk_cols = [low.get(k.lower()) for k in weekly_keys if low.get(k.lower())]
-    for col in wk_cols:
-        for row in rows[::-1]:
-            v = _to_float(row.get(col))
-            if v is not None:
-                return float(v)
 
-    # 2) 若 val_col 存在，先按它走；否则用“首个数值列”兜底
-    def first_numeric_col(sample_row: dict) -> Optional[str]:
-        if not isinstance(sample_row, dict):
-            return None
-        for k, vv in sample_row.items():
+    # 1) 直接周列
+    weekly_keys = ["weekly_net_flow_usd", "week_net_flow_usd", "weekly_flow_usd", "week_flow_usd", "weekly"]
+    for wk in weekly_keys:
+        col = low.get(wk.lower())
+        if col:
+            for row in rows[::-1]:
+                v = _to_float(row.get(col))
+                if v is not None:
+                    return float(v)
+
+    # 2) 选择数值列（优先常见名，否则首个可转 float 的列）
+    candidates = [
+        "totalnetinflow", "total_net_inflow", "totalnetinflowusd", "net_flow_usd",
+        "net_flow", "flow", "inflow", "netinflow", "net_inflow",
+    ]
+    val_col = None
+    for c in candidates:
+        if c.lower() in low:
+            val_col = low[c.lower()]
+            break
+    if not val_col:
+        for k in fieldnames:
             if date_col and k == date_col:
                 continue
-            if _to_float(vv) is not None:
-                return k
+            if _to_float(rows[0].get(k)) is not None:
+                val_col = k
+                break
+    if not val_col:
         return None
 
-    if not val_col:
-        val_col = first_numeric_col(rows[0])
-        if not val_col:
-            return None
-
-    # 3) 用 val_col 求最近 5 条（按日期排序更稳）
     series: List[Tuple[date, float]] = []
     for row in rows:
         d0 = _parse_date_any((row.get(date_col) if date_col else "") or "")
@@ -382,98 +343,139 @@ def btc_etf_weekly_flow_from_csv(csv_url: str) -> Optional[float]:
     if not series:
         return None
     series.sort(key=lambda x: x[0])
-
-    # 近 5 条求和
     last_vals = [v for _, v in series[-5:]]
     return float(sum(last_vals)) if last_vals else None
 
 
-# -------------------- Treasury auctions (10Y Note BTC) --------------------
-def treasury_10y_bid_to_cover() -> Optional[Tuple[float, float, float]]:
-    """
-    Return (latest_btc, avg_75d, avg_2y) for 10-Year Treasury Note auctions.
-    做“最小过滤”，再本地筛选：
-    - security_type=Note
-    - term 包含 10 + year（排除 20/30）
-    - tips != Yes
-    """
-    try:
-        url = TREASURY_BASE + TREASURY_AUCTION_ENDPOINT
-        today = datetime.utcnow().date()
-        start_2y = (today - timedelta(days=730)).isoformat()
+# -------------------- Treasury auction BTC (10Y Note) --------------------
+def _find_btc_value(row: dict) -> Optional[float]:
+    for k in ("bid_to_cover_ratio", "bid_to_cover", "bid_to_cover_ratio_pct", "bid_to_cover_ratio_percent"):
+        if k in row:
+            v = _to_float(row.get(k))
+            if v is not None:
+                return v
+    for k, v in row.items():
+        if "bid_to_cover" in str(k).lower():
+            vv = _to_float(v)
+            if vv is not None:
+                return vv
+    return None
 
-        params = {
-            "fields": "auction_date,security_type,original_security_term,security_term,tips,bid_to_cover_ratio",
-            "filter": f"auction_date:gte:{start_2y},security_type:eq:Note",
-            "page[size]": "1000",
-            "sort": "auction_date",
-        }
-        r = _get(url, params=params)
-        if not r:
-            return None
-        j = r.json()
+
+def _is_tips(row: dict) -> bool:
+    for k, v in row.items():
+        if "tips" in str(k).lower():
+            s = str(v).strip().lower()
+            if s in ("yes", "y", "true", "1"):
+                return True
+    return False
+
+
+def _term_text(row: dict) -> str:
+    keys = [
+        "original_security_term", "security_term", "security_term_week_year",
+        "security_term_day_month_year", "security_term_day_month", "security_term_year",
+    ]
+    parts = []
+    for k in keys:
+        if k in row and row.get(k):
+            parts.append(str(row.get(k)))
+    if not parts:
+        for k, v in row.items():
+            if "term" in str(k).lower() and v:
+                parts.append(str(v))
+    return " | ".join(parts).lower()
+
+
+def _is_10y_note(row: dict) -> bool:
+    if _is_tips(row):
+        return False
+    term = _term_text(row)
+    if "year" not in term:
+        return False
+    if not (re.search(r"\b10\b", term) or "10-" in term or "10year" in term or "10-year" in term):
+        return False
+    if re.search(r"\b20\b", term) or re.search(r"\b30\b", term):
+        return False
+    return True
+
+
+def treasury_10y_bid_to_cover() -> Optional[Tuple[float, float, float]]:
+    """Return (latest_btc, avg_75d, avg_2y) for 10Y Note auctions."""
+    url = TREASURY_BASE + TREASURY_AUCTION_ENDPOINT
+    today = datetime.utcnow().date()
+    start_2y = (today - timedelta(days=730)).isoformat()
+
+    params = {
+        "filter": f"auction_date:gte:{start_2y},security_type:eq:Note",
+        "page[size]": "1000",
+        "sort": "auction_date",
+    }
+
+    series: List[Tuple[date, float]] = []
+
+    next_url = url
+    next_params = dict(params)
+    for _ in range(5):
+        r = _get(next_url, params=next_params)
+        if not r or r.status_code >= 400:
+            if r is not None:
+                print(f"WARN: Treasury API status={r.status_code}, body={r.text[:200]}")
+            break
+        try:
+            j = r.json()
+        except Exception:
+            break
         data = j.get("data") or []
         if not isinstance(data, list) or not data:
-            return None
+            break
 
-        def is_10y_note(row: dict) -> bool:
-            term = str(row.get("original_security_term") or row.get("security_term") or "").lower()
-            tips = str(row.get("tips") or "").lower()
-            if "yes" in tips or tips in ("y", "true", "1"):
-                return False
-            # term must contain "year" and "10"
-            if "year" not in term:
-                return False
-            if not re.search(r"\b10\b", term) and "10-" not in term and "10year" not in term and "10-year" not in term:
-                return False
-            # exclude 20/30 if present
-            if re.search(r"\b20\b", term) or re.search(r"\b30\b", term):
-                return False
-            return True
-
-        series: List[Tuple[date, float]] = []
         for row in data:
             if not isinstance(row, dict):
                 continue
-            if not is_10y_note(row):
+            if not _is_10y_note(row):
                 continue
-            d = str(row.get("auction_date") or "")[:10]
-            btc = _to_float(row.get("bid_to_cover_ratio"))
-            if not d or btc is None:
+            btc = _find_btc_value(row)
+            if btc is None:
                 continue
+            d = str(row.get("auction_date") or row.get("record_date") or "")[:10]
             try:
                 d0 = datetime.strptime(d, "%Y-%m-%d").date()
             except Exception:
                 continue
             series.append((d0, float(btc)))
 
-        if not series:
-            return None
-        series.sort(key=lambda x: x[0])
-        latest_btc = series[-1][1]
+        links = (j.get("links") or {})
+        nxt = links.get("next")
+        if not nxt:
+            break
+        if isinstance(nxt, str) and nxt.startswith("&"):
+            next_url = url + "?" + nxt.lstrip("&")
+            next_params = None
+        else:
+            next_url = nxt
+            next_params = None
 
-        cutoff_75 = today - timedelta(days=75)
-        btc_75 = [v for d0, v in series if d0 >= cutoff_75]
-        btc_2y = [v for _, v in series]
-
-        if not btc_75 or not btc_2y:
-            return None
-        avg_75 = sum(btc_75) / len(btc_75)
-        avg_2y = sum(btc_2y) / len(btc_2y)
-        return (latest_btc, avg_75, avg_2y)
-    except Exception:
+    if not series:
         return None
+    series.sort(key=lambda x: x[0])
+    latest_btc = series[-1][1]
+
+    cutoff_75 = today - timedelta(days=75)
+    btc_75 = [v for d0, v in series if d0 >= cutoff_75]
+    btc_2y = [v for _, v in series]
+    if not btc_75 or not btc_2y:
+        return None
+    avg_75 = sum(btc_75) / len(btc_75)
+    avg_2y = sum(btc_2y) / len(btc_2y)
+    return (latest_btc, avg_75, avg_2y)
 
 
-# -------------------- WGC net buy (central bank gold) --------------------
+# -------------------- WGC net buy --------------------
 def wgc_netbuy_metrics(csv_url: str) -> Optional[Tuple[float, float, float]]:
-    """
-    Parse WGC net buy CSV and return:
-      (last_3m_sum_tonnes, prev_3m_sum_tonnes, last_12m_sum_tonnes)
-    自适应列名：日期列 + 首个数值列。
-    """
+    """Return (last_3m_sum, prev_3m_sum, last_12m_sum) in tonnes."""
     r = _get(csv_url)
-    if not r:
+    if not r or r.status_code >= 400:
         return None
     text = r.text.strip()
     if not text:
@@ -485,8 +487,6 @@ def wgc_netbuy_metrics(csv_url: str) -> Optional[Tuple[float, float, float]]:
         return None
 
     fieldnames = reader.fieldnames or list(rows[0].keys())
-
-    # date col
     date_col = None
     for k in fieldnames:
         kl = k.lower()
@@ -496,9 +496,8 @@ def wgc_netbuy_metrics(csv_url: str) -> Optional[Tuple[float, float, float]]:
     if not date_col:
         date_col = fieldnames[0]
 
-    # value col: try known names then fallback to first numeric
-    cand = ["net_buy_tonnes", "netbuy_tonnes", "net_buy", "netbuy", "tonnes", "tons", "ton"]
     low = {k.lower(): k for k in fieldnames}
+    cand = ["net_buy_tonnes", "netbuy_tonnes", "net_buy", "netbuy", "tonnes", "tons", "ton"]
     val_col = None
     for c in cand:
         if c.lower() in low:
@@ -514,20 +513,14 @@ def wgc_netbuy_metrics(csv_url: str) -> Optional[Tuple[float, float, float]]:
     if not val_col:
         return None
 
-    series: List[Tuple[str, float]] = []
+    series: List[Tuple[date, float]] = []
     for row in rows:
-        d = (row.get(date_col) or "").strip()
-        v = _to_float(row.get(val_col))
-        if not d or v is None:
-            continue
-        # accept YYYY-MM or YYYY-MM-DD
-        if len(d) >= 10:
-            d0 = d[:10]
-        elif len(d) == 7:
-            d0 = d + "-01"
-        else:
-            continue
-        series.append((d0, float(v)))
+        d_raw = (row.get(date_col) or "").strip()
+        d0 = _parse_date_any(d_raw)
+        v0 = _to_float(row.get(val_col))
+        if d0 and v0 is not None:
+            d0 = date(d0.year, d0.month, 1)
+            series.append((d0, float(v0)))
 
     if len(series) < 18:
         return None
@@ -544,50 +537,95 @@ def wgc_netbuy_metrics(csv_url: str) -> Optional[Tuple[float, float, float]]:
 
 # -------------------- Valuation --------------------
 def valuation_metrics(price: Optional[float], fair_low: float, fair_high: float) -> Tuple[Optional[float], float]:
-    """
-    returns (pct_vs_mid, score0_100)
-    pct_vs_mid: 相对中枢偏离（%）
-    """
     if price is None:
         return None, 50.0
     mid = (fair_low + fair_high) / 2.0
     pct = (price / mid - 1.0) * 100.0
 
-    # score: below fair_low => higher; above fair_high => lower
     if price <= fair_low:
         score = clamp(75.0 + (fair_low - price) / fair_low * 100.0, 0.0, 100.0)
     elif price >= fair_high:
-        # 价格高于上沿越多，越低分；+20% 直接 0
         premium = (price / fair_high - 1.0) * 100.0
         score = clamp(40.0 - premium * 2.0, 0.0, 100.0)
     else:
-        # fair band 内：从 70 线性降到 40
         score = score_linear(price, fair_low, fair_high, 70.0, 40.0)
 
     return float(pct), float(score)
 
 
-# -------------------- Telegram --------------------
-def telegram_send_html(text_html: str) -> bool:
+# -------------------- Telegram (robust) --------------------
+def _telegram_call(token: str, payload: dict) -> Tuple[bool, str]:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        r = requests.post(url, data=payload, timeout=TIMEOUT)
+    except Exception as e:
+        return False, f"exception={e}"
+
+    # Telegram 有时 200 但 ok=false
+    try:
+        j = r.json()
+        ok = bool(j.get("ok"))
+        if ok:
+            return True, "ok"
+        return False, f"status={r.status_code} ok=false desc={j.get('description')}"
+    except Exception:
+        return (r.status_code < 400), f"status={r.status_code} text={r.text[:300]}"
+
+
+def _strip_b_tags(s: str) -> str:
+    return re.sub(r"</?b>", "", s)
+
+
+def _escape_html_preserve_b(s: str) -> str:
+    """
+    Telegram HTML 需要转义文本里的 <, >, &。
+    这里仅保留 <b> 和 </b> 标签。
+    """
+    s = s.replace("<b>", "%%B_OPEN%%").replace("</b>", "%%B_CLOSE%%")
+    s = _html.escape(s)
+    s = s.replace("%%B_OPEN%%", "<b>").replace("%%B_CLOSE%%", "</b>")
+    return s
+
+
+def telegram_send(text_html: str) -> bool:
     token = env("TELEGRAM_BOT_TOKEN", "")
     chat_id = env("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
         print("WARN: TELEGRAM_BOT_TOKEN/CHAT_ID 未配置，仅打印：")
         print(text_html)
-        return False
+        return True  # 不让 job 因未配置而失败
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
+    # 1) HTML（真加粗）
+    html_safe = _escape_html_preserve_b(text_html)
+    payload_html = {
         "chat_id": chat_id,
-        "text": text_html,
+        "text": html_safe,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    try:
-        r = requests.post(url, data=payload, timeout=TIMEOUT)
-        return r.status_code < 400
-    except Exception:
-        return False
+
+    for i in range(3):
+        ok, info = _telegram_call(token, payload_html)
+        if ok:
+            return True
+        print(f"WARN: Telegram HTML send failed attempt={i+1} {info}")
+        time.sleep(2)
+
+    # 2) 回退：纯文本（确保至少能发出去）
+    payload_plain = {
+        "chat_id": chat_id,
+        "text": _strip_b_tags(text_html),
+        "disable_web_page_preview": True,
+    }
+    for i in range(2):
+        ok, info = _telegram_call(token, payload_plain)
+        if ok:
+            print("WARN: HTML 失败，已回退纯文本发送。")
+            return True
+        print(f"WARN: Telegram plain send failed attempt={i+1} {info}")
+        time.sleep(2)
+
+    return False
 
 
 # -------------------- Message builder --------------------
@@ -641,28 +679,34 @@ def format_int(n: Optional[float]) -> str:
 def build_actions(pack: Pack, fair_low: float, fair_high: float, plan_max: float) -> List[str]:
     price = pack.price
     vol = pack.vol14
-    overall = (pack.s1 * 0.25 + pack.s2 * 0.20 + pack.s3 * 0.25 + pack.s4 * 0.10 + pack.s5 * 0.15 + pack.s6 * 0.05) / 1.0
-    overall = clamp(overall)
 
+    overall = (
+        pack.s1 * 0.25
+        + pack.s2 * 0.20
+        + pack.s3 * 0.25
+        + pack.s4 * 0.10
+        + pack.s5 * 0.15
+        + pack.s6 * 0.05
+    )
+    overall = clamp(overall)
     st = stance(overall)
 
-    # 估值偏贵判断
     expensive = (price is not None and price >= fair_high)
 
-    # 仓位建议更“抓趋势”：给明确上限（以计划上限为基准）
+    # 仓位上限建议（更聚焦“大势”）
     cap_ratio = 1.0
     if expensive and overall < 45:
         cap_ratio = 0.70
     elif expensive and overall < 55:
         cap_ratio = 0.85
-    elif (not expensive) and overall >= 60:
-        cap_ratio = 1.00
     elif (not expensive) and overall < 40:
         cap_ratio = 0.60
+    else:
+        cap_ratio = 1.00
 
     cap_weight = plan_max * cap_ratio
 
-    # 风控线（紧/标准/宽）：用“收盘价”触发 → 次日执行
+    # 风控线：紧/标准/宽（只看收盘价，次日执行）
     tight = std = loose = None
     if price is not None and vol is not None:
         tight = price - 1.0 * vol
@@ -675,7 +719,10 @@ def build_actions(pack: Pack, fair_low: float, fair_high: float, plan_max: float
     lines.append(f"<b>结论：{st}（综合 {int(round(overall))}/100）</b>")
 
     if expensive:
-        lines.append(f"<b>仓位建议：</b>估值偏贵 → 建议黄金不高于计划上限的<b>{int(round(cap_ratio*100))}%</b>（约<b>{cap_weight:.1f}%</b>组合仓位）")
+        lines.append(
+            f"<b>仓位建议：</b>估值偏贵 → 建议黄金不高于计划上限的<b>{int(round(cap_ratio*100))}%</b>"
+            f"（约<b>{cap_weight:.1f}%</b>组合仓位）"
+        )
     else:
         lines.append(f"<b>仓位建议：</b>未明显偏贵 → 计划上限内顺势分批（上限<b>{plan_max:.1f}%</b>）")
 
@@ -684,30 +731,30 @@ def build_actions(pack: Pack, fair_low: float, fair_high: float, plan_max: float
     if price is not None and tps:
         above = [x for x in tps if x > price]
         if above:
-            first_tp = above[0]
-            lines.append(f"<b>止盈：</b>{', '.join(str(int(x)) for x in tps[:3])}（先盯<b>{int(first_tp)}</b>，到位分批落袋）")
+            lines.append(
+                f"<b>止盈：</b>{', '.join(str(int(x)) for x in tps[:3])}"
+                f"（先盯<b>{int(above[0])}</b>，到位分批落袋）"
+            )
         else:
             lines.append("<b>止盈：</b>已高于全部止盈位 → 建议分批落袋 + 上移风控线")
 
-    # 风控（更易懂的 if/then）
+    # 风控（更“傻瓜化” if/then）
     if tight is not None and std is not None and loose is not None:
         lines.append(
-            f"<b>风控（只看“收盘价”，次日执行）：</b>"
-            f"紧<b>{int(tight):,}</b> / 标准<b>{int(std):,}</b> / 宽<b>{int(loose):,}</b>"
+            f"<b>风控（只看收盘价，次日执行）：</b>"
+            f"标准线<b>{int(std):,}</b>（默认）｜紧线{int(tight):,}｜宽线{int(loose):,}"
         )
-        lines.append(
-            f"- 若收盘价 < <b>{int(std):,}</b>（标准线）→ 次日先减仓<b>50%</b>"
-        )
-        lines.append(
-            f"- 若收盘价 < <b>{int(loose):,}</b>（宽线）→ 保留<b>0–30%</b>或清仓（按你的风险偏好）"
-        )
+        lines.append(f"- 若收盘价 < <b>{int(std):,}</b> → 次日先减仓<b>50%</b>")
+        lines.append(f"- 若收盘价 < <b>{int(loose):,}</b> → 保留<b>0–30%</b>或清仓（按你风险偏好）")
 
-    lines.append(f"<b>0仓策略：</b>不追高；仅当回调到 ≤ <b>{int(buy_trigger):,}</b> 再建“观察仓”（先买计划的<b>10–20%</b>）")
+    lines.append(
+        f"<b>0仓策略：</b>不追高；仅当回调到 ≤ <b>{int(buy_trigger):,}</b> 再建“观察仓”（先买计划的<b>10–20%</b>）"
+    )
     return lines
 
 
 def build_message(pack: Pack, fair_low: float, fair_high: float) -> str:
-    version = "v1.5.11"
+    version = "v1.5.12"
     ts = now_cst_str()
 
     price = pack.price
@@ -717,7 +764,6 @@ def build_message(pack: Pack, fair_low: float, fair_high: float) -> str:
     else:
         vol_str = "N/A"
 
-    # signals text
     s1 = f"{pack.dfii10:.2f}%" if pack.dfii10 is not None else "N/A"
     wow = f"{pack.dfii10_wow:+.2f}pp" if pack.dfii10_wow is not None else "N/A"
     usd = f"{pack.usd_30d_pct:+.2f}%" if pack.usd_30d_pct is not None else "N/A"
@@ -729,7 +775,6 @@ def build_message(pack: Pack, fair_low: float, fair_high: float) -> str:
         delta = avg75 - avg2y
         auc_str = f"{last_btc:.2f}（75d均{avg75:.2f} vs 2y均{avg2y:.2f}，Δ{delta:+.2f}）"
 
-    # valuation
     if price is not None:
         pct_vs_mid, _ = valuation_metrics(price, fair_low, fair_high)
         val_label = "偏贵" if price >= fair_high else ("偏便宜" if price <= fair_low else "公允")
@@ -739,11 +784,10 @@ def build_message(pack: Pack, fair_low: float, fair_high: float) -> str:
 
     cb_str = "N/A"
     if pack.cb:
-        cb_3m, cb_prev3, cb_12m = pack.cb
+        cb_3m, cb_prev3, _ = pack.cb
         mom = cb_3m - cb_prev3
         cb_str = f"近3M {cb_3m:+.1f}t（较前3M {mom:+.1f}t）"
 
-    # Compose (HTML)
     msg_lines: List[str] = []
     msg_lines.append(f"GoldTrendAlert | Liquidity {version}  {ts}")
     msg_lines.append(f"现价：{p_str}  | 14日波动带：{vol_str}")
@@ -760,12 +804,11 @@ def build_message(pack: Pack, fair_low: float, fair_high: float) -> str:
     plan_max = _to_float(env("PLAN_MAX_GOLD_WEIGHT", str(DEFAULT_PLAN_MAX))) or DEFAULT_PLAN_MAX
     msg_lines.extend(build_actions(pack, fair_low, fair_high, plan_max))
     msg_lines.append("")
-    msg_lines.append(f"来源：现价=Stooq XAUUSD；ETF=CSV/SoSo；拍卖=US Treasury Fiscal Data；购金=WGC CSV")
+    msg_lines.append("来源：现价=Stooq XAUUSD；ETF=CSV/SoSo；拍卖=US Treasury Fiscal Data；购金=WGC CSV")
     return "\n".join(msg_lines).strip()
 
 
 def main() -> int:
-    # Read config
     fred_key = env("FRED_API_KEY", DEFAULT_FRED_API_KEY)
     soso_key = env("SOSOVALUE_API_KEY", DEFAULT_SOSO_API_KEY)
 
@@ -775,11 +818,10 @@ def main() -> int:
     btc_csv = env("BTC_ETF_FLOWS_CSV_URL", DEFAULT_BTC_ETF_CSV)
     wgc_csv = env("WGC_CSV_URL", DEFAULT_WGC_CSV)
 
-    # price + vol
     price = stooq_xau_last_price()
     vol14, vol14_pct = compute_vol14_band(price)
 
-    # Signal 1: DFII10 (10Y TIPS real yield)
+    # 1) DFII10
     dfii_series = fred_series("DFII10", fred_key, limit=900)
     dfii_last = latest_non_null(dfii_series)
     dfii10 = dfii10_wow = None
@@ -790,8 +832,6 @@ def main() -> int:
         back = nearest_on_or_before(dfii_series, d_last - timedelta(days=7))
         if back:
             dfii10_wow = v_last - back[1]
-        # score: lower real yield => higher gold score
-        # <=0.5 -> 85 ; >=2.5 -> 20 (linear)
         if v_last <= 0.5:
             s1 = 85.0
         elif v_last >= 2.5:
@@ -800,7 +840,7 @@ def main() -> int:
             s1 = score_linear(v_last, 0.5, 2.5, 85.0, 20.0)
         s1 = clamp(s1)
 
-    # Signal 2: DTWEXBGS (broad dollar index) 30d change
+    # 2) DTWEXBGS 30d
     usd_series = fred_series("DTWEXBGS", fred_key, limit=1200)
     usd_last = latest_non_null(usd_series)
     usd_30d_pct = None
@@ -811,14 +851,13 @@ def main() -> int:
         if back30 and back30[1] not in (None, 0):
             usd_30d_pct = (v_last / back30[1] - 1.0) * 100.0
         if usd_30d_pct is not None:
-            # +5% => 20; 0 => 50; -5% => 80
             if usd_30d_pct >= 0:
                 s2 = score_linear(usd_30d_pct, 0.0, 5.0, 50.0, 20.0)
             else:
                 s2 = score_linear(usd_30d_pct, -5.0, 0.0, 80.0, 50.0)
             s2 = clamp(s2)
 
-    # Signal 3: BTC spot ETF weekly net flow (prefer CSV; fallback SoSo)
+    # 3) ETF weekly (CSV -> SoSo)
     etf_weekly_flow = btc_etf_weekly_flow_from_csv(btc_csv)
     etf_src = "CSV"
     if etf_weekly_flow is None:
@@ -827,7 +866,6 @@ def main() -> int:
 
     s3 = 50.0
     if etf_weekly_flow is not None:
-        # inflow risk-on => lower gold score; outflow => higher gold score
         if etf_weekly_flow >= 2e9:
             s3 = 20.0
         elif etf_weekly_flow >= 0:
@@ -836,26 +874,23 @@ def main() -> int:
             s3 = score_linear(etf_weekly_flow, -2e9, 0.0, 80.0, 55.0)
         s3 = clamp(s3)
 
-    # Signal 4: 10Y auction BTC
+    # 4) 10Y auction BTC
     auc = treasury_10y_bid_to_cover()
     s4 = 50.0
     if auc:
-        latest_btc, avg75, avg2y = auc
+        _, avg75, avg2y = auc
         delta = avg75 - avg2y
-        # 弱于2y均值（delta<0）=> 需求变弱，利率压力可能更大 => gold score 下调
-        # delta +0.10 => 60; delta -0.10 => 40
         s4 = clamp(score_linear(delta, -0.10, 0.10, 40.0, 60.0))
 
-    # Signal 5: valuation
-    pct_vs_mid, s5 = valuation_metrics(price, fair_low, fair_high)
+    # 5) valuation
+    _, s5 = valuation_metrics(price, fair_low, fair_high)
 
-    # Signal 6: central bank buy trend
+    # 6) CB buy (WGC)
     cb = wgc_netbuy_metrics(wgc_csv)
     s6 = 50.0
     if cb:
         cb_3m, cb_prev3, _ = cb
         mom = cb_3m - cb_prev3
-        # mom +50t => 70; mom -50t => 40
         s6 = clamp(score_linear(mom, -50.0, 50.0, 40.0, 70.0))
 
     pack = Pack(
@@ -880,10 +915,11 @@ def main() -> int:
     msg = build_message(pack, fair_low, fair_high)
     print(msg)
 
-    ok = telegram_send_html(msg)
+    ok = telegram_send(msg)
     if ok:
         print("Telegram sent OK.")
         return 0
+
     print("Telegram send failed.")
     return 1
 
